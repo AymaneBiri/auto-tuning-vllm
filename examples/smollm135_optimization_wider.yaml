@@ -1,0 +1,46 @@
+study:
+  name: "smollm135_wider_profiling"
+
+optimization:
+  # Balanced optimization: Find best throughput vs latency trade-offs
+  approach: "multi_objective"
+  objectives:
+    - metric: "output_tokens_per_second"  # Maximize throughput
+      direction: "maximize"
+      percentile: "median"
+    - metric: "time_to_first_token_ms"  # Minimize time to first token
+      direction: "minimize"
+      percentile: "p95"
+  sampler: "nsga2"  # Fast for testing (use nsga2 for real optimization)
+  n_trials: 50
+
+benchmark:
+  benchmark_type: "guidellm"
+  model: "HuggingFaceTB/SmolLM2-135M"
+  max_seconds: 120
+  rate: 50
+  dataset: null
+  prompt_tokens: 2000
+  output_tokens: 500
+  #dataset: "hf://ChaoticNeutrals/Creative_Writing-ShareGPT"
+
+logging:
+  file_path: "/tmp/auto-tune-vllm-logs"
+  log_level: "INFO"
+
+parameters:
+  gpu_memory_utilization:
+    enabled: true
+    options: [0.90]   # blog suggests 0.95 for bare-metal; default 0.90
+
+  kv_cache_dtype:
+    enabled: true
+    options: ["auto", "fp8"]       # fp8 halves KV cache size, doubling concurrency
+
+  max_num_seqs:
+    enabled: true
+    options: [256, 512, 1024, 2048, 4096]    # default 1024; blog recommends 2048 for high-concurrency
+
+  max_num_batched_tokens:
+    enabled: true
+    options: [1024, 2048, 4096, 8192, 16384, 32768]  # 16384 for throughput, 2048 for fairness with chunked prefill

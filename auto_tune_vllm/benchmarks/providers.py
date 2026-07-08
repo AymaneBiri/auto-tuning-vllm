@@ -516,4 +516,3 @@ BENCHMARK_PROVIDERS = {
     "guidellm": GuideLLMBenchmark,
     "custom_template": CustomBenchmarkTemplate,
 }
-
