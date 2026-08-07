@@ -27,11 +27,11 @@ DO_DOWNLOAD=1
 DO_SMOKE=1
 GRACE=120
 SMOKE_PORT=8765
-EXPECTED_GPUS=8
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="${REPO_DIR}/run_logs"
 RUN_LOG="${LOG_DIR}/study_${RUN_TS}.log"
 SMOKE_LOG="${LOG_DIR}/smoke_${RUN_TS}.log"
+CONTAINER_API_KEY="d70a14830aaad424ba819caa6eadb19df7227f95988975c399d5d43de1ca738e"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -51,11 +51,44 @@ log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m[warn] %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31m[fail] %s\033[0m\n' "$*" >&2; exit 1; }
 
+# Free GB on the filesystem holding $1, walking up to the nearest existing
+# parent so it works on a cache dir that has not been created yet.
+free_gb() {
+  local target="$1"
+  while [[ ! -d "$target" && "$target" != "/" ]]; do target="$(dirname "$target")"; done
+  df -BG --output=avail "$target" | tail -1 | tr -dc '0-9'
+}
+
+fs_of() {
+  local target="$1"
+  while [[ ! -d "$target" && "$target" != "/" ]]; do target="$(dirname "$target")"; done
+  df --output=source "$target" | tail -1
+}
+
+# SIGTERM, then SIGKILL if it is still alive. A bare 'kill' + 'wait' can block
+# forever: vLLM runs EngineCore in its own process and the parent's graceful
+# shutdown can wedge on an engine that is mid-cudagraph-capture, which would
+# hang this script with the instance still billing.
+stop_vllm() {
+  local pid="$1" waited=0
+  kill -TERM "$pid" 2>/dev/null || true
+  while [[ $waited -lt 30 ]] && kill -0 "$pid" 2>/dev/null; do
+    sleep 2
+    waited=$(( waited + 2 ))
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    warn "vLLM ignored SIGTERM after ${waited}s - sending SIGKILL."
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # Stop-on-exit. Registered before any long-running work so that a crash, an
 # OOM, or a Ctrl-C still parks the instance instead of billing overnight.
 # ---------------------------------------------------------------------------
 STOP_ARMED=0
+VASTAI_BIN=""
 
 finish() {
   local rc=$?
@@ -84,8 +117,9 @@ finish() {
   fi
 
   if [[ $STOP_ARMED -eq 0 ]]; then
-    warn "No vast.ai stop credentials were found; cannot stop automatically."
-    warn "Stop it yourself: vastai stop instance <ID>"
+    warn "Auto-stop was never armed (missing credentials or no vastai CLI)."
+    warn "THIS INSTANCE IS STILL BILLING. Stop it yourself:"
+    warn "  vastai stop instance ${CONTAINER_ID:-<ID>}"
     exit $rc
   fi
 
@@ -99,12 +133,19 @@ finish() {
     sleep "$GRACE"
   fi
 
-  vastai stop instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY" \
+  # Resolved at arm time: activating the venv reorders PATH, and pip may have
+  # dropped the CLI somewhere that is not on it.
+  "$VASTAI_BIN" stop instance "$CONTAINER_ID" --api-key "$CONTAINER_API_KEY" \
     || warn "Stop command failed. Stop it manually: vastai stop instance ${CONTAINER_ID}"
 
   exit $rc
 }
 trap finish EXIT
+
+# Without these, a signal-terminated bash reports $? == 0 to the EXIT trap and
+# the summary claims the study "finished cleanly" after a Ctrl-C.
+trap 'warn "Received SIGINT."; exit 130' INT
+trap 'warn "Received SIGTERM."; exit 143' TERM
 
 # ---------------------------------------------------------------------------
 # Pre-flight. Everything that could make the run pointless is checked here,
@@ -116,6 +157,8 @@ log "Pre-flight checks"
 
 MODEL="$(grep -E '^\s{2}model:' "$CONFIG" | head -1 | sed 's/.*model:\s*//' | tr -d '"'"'"' ' | sed 's/#.*//')"
 STUDY_NAME="$(grep -A2 '^study:' "$CONFIG" | grep -E '^\s+name:' | head -1 | sed 's/.*name:\s*//' | tr -d '"'"'"' ' | sed 's/#.*//')"
+MAX_CONC="$(grep -E '^\s+max_concurrent_trials:' "$CONFIG" | head -1 | tr -dc '0-9')"
+MAX_CONC="${MAX_CONC:-1}"
 [[ -n "$MODEL" ]] || die "Could not parse the model out of ${CONFIG}"
 echo "  config : ${CONFIG}"
 echo "  study  : ${STUDY_NAME}"
@@ -132,20 +175,35 @@ if [[ $AUTO_STOP -eq 1 ]]; then
     warn "CONTAINER_ID / CONTAINER_API_KEY not set - auto-stop is DISABLED."
     warn "Check 'env | grep CONTAINER', or re-run with --no-stop to silence this."
   else
-    command -v vastai >/dev/null 2>&1 || pip install --quiet vastai
-    STOP_ARMED=1
-    echo "  auto-stop: armed for instance ${CONTAINER_ID}"
+    # Never fatal. A failed install here used to abort the whole pre-flight with
+    # STOP_ARMED still 0 - i.e. the one failure mode that leaves the instance
+    # billing forever. Warn and carry on instead.
+    if ! command -v vastai >/dev/null 2>&1; then
+      pip install --quiet vastai 2>/dev/null \
+        || pip install --quiet --break-system-packages vastai 2>/dev/null \
+        || true
+      hash -r
+    fi
+    VASTAI_BIN="$(command -v vastai || true)"
+    if [[ -n "$VASTAI_BIN" ]]; then
+      STOP_ARMED=1
+      echo "  auto-stop: armed for instance ${CONTAINER_ID} (${VASTAI_BIN})"
+    else
+      warn "vastai CLI unavailable - auto-stop is DISABLED."
+      warn "Stop it yourself when this ends: vastai stop instance ${CONTAINER_ID}"
+    fi
   fi
 fi
 
 # --- GPUs -----------------------------------------------------------------
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found - no GPU driver?"
+command -v curl >/dev/null 2>&1 || die "curl not found - the smoke test needs it to poll the server."
 GPU_COUNT="$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)"
 echo "  GPUs   : ${GPU_COUNT}"
 nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader | sed 's/^/           /'
-if [[ "$GPU_COUNT" -lt "$EXPECTED_GPUS" ]]; then
-  warn "Config sets max_concurrent_trials: 8 but only ${GPU_COUNT} GPU(s) are visible."
-  warn "Trials will queue instead of running 8-wide. Lower max_concurrent_trials to match."
+if [[ "$GPU_COUNT" -lt "$MAX_CONC" ]]; then
+  warn "Config sets max_concurrent_trials: ${MAX_CONC} but only ${GPU_COUNT} GPU(s) are visible."
+  warn "Trials will queue instead of running ${MAX_CONC}-wide. Lower max_concurrent_trials to match."
 fi
 
 # --- HF token (Gemma is a gated repo) -------------------------------------
@@ -164,9 +222,22 @@ else
 fi
 
 # --- disk ------------------------------------------------------------------
-AVAIL_GB="$(df -BG --output=avail "$REPO_DIR" | tail -1 | tr -dc '0-9')"
-echo "  disk   : ${AVAIL_GB} GB free"
-[[ "$AVAIL_GB" -ge 80 ]] || die "Only ${AVAIL_GB} GB free. Need ~35 GB for weights plus ~20 GB for the venv (torch + vLLM)."
+# The venv and the weights can land on different mounts (a mounted cache volume
+# is common), so check whichever filesystem each one actually goes to.
+CACHE_DIR="${HF_HOME:-${HOME:-/root}/.cache/huggingface}"
+REPO_GB="$(free_gb "$REPO_DIR")"
+CACHE_GB="$(free_gb "$CACHE_DIR")"
+REPO_FS="$(fs_of "$REPO_DIR")"
+CACHE_FS="$(fs_of "$CACHE_DIR")"
+if [[ "$REPO_FS" == "$CACHE_FS" ]]; then
+  echo "  disk   : ${REPO_GB} GB free on ${REPO_FS} (venv + weights)"
+  [[ "$REPO_GB" -ge 80 ]] || die "Only ${REPO_GB} GB free. Need ~35 GB for weights plus ~20 GB for the venv (torch + vLLM)."
+else
+  echo "  disk   : ${REPO_GB} GB free on ${REPO_FS} (venv)"
+  echo "           ${CACHE_GB} GB free on ${CACHE_FS} (HF cache)"
+  [[ "$REPO_GB" -ge 30 ]]  || die "Only ${REPO_GB} GB free on ${REPO_FS}; the venv (torch + vLLM) needs ~20 GB."
+  [[ "$CACHE_GB" -ge 45 ]] || die "Only ${CACHE_GB} GB free on ${CACHE_FS}; the weights need ~35 GB."
+fi
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -174,7 +245,10 @@ echo "  disk   : ${AVAIL_GB} GB free"
 log "Setting up the Python environment"
 if [[ ! -d "$VENV" ]]; then
   if command -v uv >/dev/null 2>&1; then
-    uv venv --python 3.12 "$VENV"
+    # --seed puts pip inside the venv. Without it 'pip' after activation silently
+    # falls through PATH to the system pip, so 'pip list' shows the wrong
+    # environment and 'pip install' fixes packages nobody is running.
+    uv venv --python 3.12 --seed "$VENV"
   else
     python3 -m venv "$VENV"
   fi
@@ -191,7 +265,9 @@ set -u
 if ! python -c 'import auto_tune_vllm' >/dev/null 2>&1; then
   log "Installing auto-tune-vllm (pulls vLLM + torch; this takes a while)"
   if command -v uv >/dev/null 2>&1; then
-    uv pip install -e .
+    # --python is explicit on purpose: never rely on activation alone to decide
+    # which interpreter gets the packages.
+    uv pip install --python "${VENV}/bin/python" -e .
   else
     pip install --upgrade pip && pip install -e .
   fi
@@ -208,6 +284,51 @@ for pkg in ("vllm", "guidellm", "optuna", "ray"):
     except PackageNotFoundError:
         print(f"  {pkg:<9}: NOT INSTALLED")
 PY
+
+# Everything below runs through the venv's interpreter, so it reports on the
+# environment the trials actually use.
+python - <<'PY' || die "Not running inside ${VENV} - the environment setup is broken."
+import sys
+raise SystemExit(0 if sys.prefix != sys.base_prefix else 1)
+PY
+
+# flashinfer ships as several separate distributions that must be version-locked.
+# When they skew, the mismatch raises at *import* time inside EngineCore, which
+# surfaces ~10 minutes in as a stack trace after the weights have already loaded.
+python - "$VENV" <<'PY' || die "flashinfer version skew (see above). Fix it before spending GPU time."
+import sys
+from importlib.metadata import distributions
+
+venv = sys.argv[1]
+found = {}
+for dist in distributions():
+    name = (dist.metadata["Name"] or "").lower()
+    if name.startswith("flashinfer"):
+        found[name] = dist.version
+
+if not found:
+    print("  flashinfer: not installed")
+    raise SystemExit(0)
+if len(set(found.values())) == 1:
+    print(f"  flashinfer: {next(iter(found.values()))} ({len(found)} packages, consistent)")
+    raise SystemExit(0)
+
+print("  flashinfer VERSION SKEW - the engine will fail on import:")
+for name in sorted(found):
+    print(f"    {name:<24} {found[name]}")
+target = found.get("flashinfer-python") or max(found.values())
+for name in sorted(found):
+    if found[name] != target:
+        print(f'  fix: uv pip install --python {venv}/bin/python "{name}=={target}"')
+raise SystemExit(1)
+PY
+
+# The CLI is typer-based, and a typer/click mismatch makes every 'raise
+# typer.Exit' escape as an uncaught traceback with a non-zero status - including
+# the successful paths. Catch it here rather than mid-study.
+auto-tune-vllm --help >/dev/null 2>&1 \
+  || die "The auto-tune-vllm CLI errors out on --help (typer/click mismatch is the usual cause). Every trial goes through it."
+
 echo "  NOTE: the config's VLLM_FLASH_ATTN_VERSION=4 arm needs a build that ships"
 echo "        FA4 for Hopper. On an older vLLM it silently falls back to FA3."
 
@@ -244,9 +365,15 @@ fi
 # silently invalidate the study - actual KV capacity, and whether FA4 is real.
 # ---------------------------------------------------------------------------
 if [[ $DO_SMOKE -eq 1 ]]; then
-  log "Smoke test: starting vLLM once on GPU 0 (~3-5 min)"
+  # Match the timeout the trials get, rather than hardcoding a stricter one that
+  # fails pre-flight on a cold start the study itself would have tolerated.
+  SMOKE_TIMEOUT="$(grep -E '^\s+VLLM_STARTUP_TIMEOUT:' "$CONFIG" | head -1 | tr -dc '0-9')"
+  SMOKE_TIMEOUT="${SMOKE_TIMEOUT:-1800}"
+  log "Smoke test: starting vLLM once on GPU 0 (timeout ${SMOKE_TIMEOUT}s)"
 
-  CUDA_VISIBLE_DEVICES=0 VLLM_FLASH_ATTN_VERSION=4 \
+  # PYTHONUNBUFFERED: vLLM logs to stdout, which is block-buffered once
+  # redirected to a file.
+  PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES=0 VLLM_FLASH_ATTN_VERSION=4 \
     vllm serve "$MODEL" \
       --tensor-parallel-size 1 \
       --max-model-len 8192 \
@@ -256,19 +383,39 @@ if [[ $DO_SMOKE -eq 1 ]]; then
       --port "$SMOKE_PORT" > "$SMOKE_LOG" 2>&1 &
   SMOKE_PID=$!
 
-  for _ in $(seq 1 120); do
-    if grep -qiE "Application startup complete|GPU KV cache size" "$SMOKE_LOG"; then
+  # Readiness is the HTTP endpoint answering, NOT a string in the log. Log lines
+  # get renamed between vLLM releases and the engine core writes from its own
+  # process, so grepping for a magic phrase can spin forever against a server
+  # that came up fine. The log is still parsed below, but only for reporting.
+  SMOKE_STATE="timeout"
+  SMOKE_DEADLINE=$(( SECONDS + SMOKE_TIMEOUT ))
+  while [[ $SECONDS -lt $SMOKE_DEADLINE ]]; do
+    if curl -fsS -m 5 "http://127.0.0.1:${SMOKE_PORT}/v1/models" >/dev/null 2>&1; then
+      SMOKE_STATE="ready"
       break
     fi
     if ! kill -0 "$SMOKE_PID" 2>/dev/null; then
-      warn "vLLM exited during the smoke test - see ${SMOKE_LOG}"
+      SMOKE_STATE="died"
       break
     fi
-    sleep 10
+    sleep 5
   done
 
-  kill "$SMOKE_PID" 2>/dev/null || true
-  wait "$SMOKE_PID" 2>/dev/null || true
+  stop_vllm "$SMOKE_PID"
+
+  # The study grabs all 8 GPUs immediately after this. A straggler still holding
+  # 92% of GPU 0 would take out the first trial with an OOM that looks like a
+  # bad parameter combination.
+  GPU0_MB=0
+  for _ in $(seq 1 24); do
+    GPU0_MB="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i 0 | tr -dc '0-9')"
+    [[ "${GPU0_MB:-0}" -lt 2000 ]] && break
+    sleep 5
+  done
+  if [[ "${GPU0_MB:-0}" -ge 2000 ]]; then
+    warn "GPU 0 still holds ${GPU0_MB} MiB two minutes after the smoke test."
+    warn "Check 'nvidia-smi' for orphaned vLLM processes before trusting trial 1."
+  fi
 
   echo
   echo "  --- KV capacity -------------------------------------------------"
@@ -288,10 +435,22 @@ if [[ $DO_SMOKE -eq 1 ]]; then
   grep -iE "cudagraph|capturing" "$SMOKE_LOG" | head -5 | sed 's/^/  /' || true
   echo
   echo "  full smoke log: ${SMOKE_LOG}"
+  echo
 
-  if ! grep -qi "GPU KV cache size" "$SMOKE_LOG"; then
-    die "vLLM never reported a KV cache size - it likely failed to start. See ${SMOKE_LOG}"
-  fi
+  # Gate on whether the server actually served. A missing log line means the
+  # grep patterns above have gone stale, which is worth a warning but is not a
+  # reason to abort a healthy run.
+  case "$SMOKE_STATE" in
+    ready)
+      log "Smoke test passed: vLLM answered on port ${SMOKE_PORT}."
+      ;;
+    died)
+      die "vLLM exited during the smoke test. See ${SMOKE_LOG}"
+      ;;
+    timeout)
+      die "vLLM did not answer on port ${SMOKE_PORT} within ${SMOKE_TIMEOUT}s. See ${SMOKE_LOG}"
+      ;;
+  esac
 else
   log "Skipping smoke test (--skip-smoke-test)"
 fi
