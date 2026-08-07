@@ -150,6 +150,18 @@ fi
 
 # --- HF token (Gemma is a gated repo) -------------------------------------
 [[ -n "${HF_TOKEN:-}" ]] || die "HF_TOKEN is not set. Gemma is gated: accept the license on the model page, then 'export HF_TOKEN=hf_xxx'."
+export HF_TOKEN
+
+# Trial vLLM servers are spawned with os.environ.copy() from the Ray worker,
+# which inherits from the Ray head this script starts. Export HF_HOME here so
+# the cache location actually reaches them - otherwise every trial looks in the
+# default cache, misses, and re-pulls ~35 GB.
+if [[ -n "${HF_HOME:-}" ]]; then
+  export HF_HOME
+  echo "  HF_HOME: ${HF_HOME}"
+else
+  echo "  HF_HOME: (unset -> ~/.cache/huggingface)"
+fi
 
 # --- disk ------------------------------------------------------------------
 AVAIL_GB="$(df -BG --output=avail "$REPO_DIR" | tail -1 | tr -dc '0-9')"
@@ -204,14 +216,24 @@ echo "        FA4 for Hopper. On an older vLLM it silently falls back to FA3."
 # ---------------------------------------------------------------------------
 if [[ $DO_DOWNLOAD -eq 1 ]]; then
   log "Downloading ${MODEL}"
-  # 'hf' is the current CLI; 'huggingface-cli' is the pre-2025 name.
-  if command -v hf >/dev/null 2>&1; then
-    hf download "$MODEL"
-  elif command -v huggingface-cli >/dev/null 2>&1; then
-    huggingface-cli download "$MODEL"
-  else
-    python -c "from huggingface_hub import snapshot_download; snapshot_download('${MODEL}')"
-  fi
+  # Use the Python API, not the 'hf' CLI. The CLI leaks an uncaught
+  # click.exceptions.Exit(0) traceback and returns non-zero even when the
+  # download succeeded, which set -e turns into a spurious abort. The API
+  # returns the snapshot path and raises only on genuine failures.
+  MODEL_PATH="$(
+    python - "$MODEL" <<'PY' | tail -1
+import sys
+from huggingface_hub import snapshot_download
+print(snapshot_download(sys.argv[1]))
+PY
+  )" || die "Model download failed for ${MODEL}"
+
+  # Verify the weights are really there rather than trusting an exit code.
+  [[ -d "$MODEL_PATH" ]] || die "Snapshot path does not exist: ${MODEL_PATH}"
+  SHARDS="$(find "$MODEL_PATH" -name '*.safetensors' | wc -l)"
+  [[ "$SHARDS" -gt 0 ]] || die "No .safetensors weights under ${MODEL_PATH}"
+  echo "  path  : ${MODEL_PATH}"
+  echo "  files : ${SHARDS} safetensors shards, $(du -shL "$MODEL_PATH" 2>/dev/null | cut -f1) on disk"
   log "Download complete"
 else
   log "Skipping download (--skip-download)"
@@ -284,12 +306,20 @@ echo "  Follow along: tail -f ${RUN_LOG}"
 echo "  Trial detail: auto-tune-vllm logs --study-name ${STUDY_NAME} --log-path /tmp/auto-tune-vllm-logs"
 echo
 
-# max_concurrent_trials comes from the config (8). Ray head is started here
-# because a fresh vast.ai box has no cluster running.
+# A previous aborted run can leave a Ray head behind; starting a second one
+# fails on a port conflict. Attach to it instead if it is already up.
+RAY_FLAG="--start-ray-head"
+if ray status >/dev/null 2>&1; then
+  warn "Existing Ray cluster detected - attaching instead of starting a new head."
+  warn "If it is stale, cancel and run: ray stop --force"
+  RAY_FLAG="--no-start-ray-head"
+fi
+
+# max_concurrent_trials comes from the config (8).
 auto-tune-vllm optimize \
   --config "$CONFIG" \
   --venv-path "$VENV" \
-  --start-ray-head \
+  "$RAY_FLAG" \
   --verbose 2>&1 | tee "$RUN_LOG"
 
 # The trap handles the summary and the instance stop.
