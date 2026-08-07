@@ -93,10 +93,6 @@ static_parameters:
   # CUDA graphs are effectively always faster than eager for decode; enforce_eager
   # is a debugging fallback, not a tuning knob. Pinned off rather than sampled.
   enforce_eager: false
-  # Text-only synthetic workload: skip the multimodal encoder cache allocation.
-  # Remove this if you actually serve images/video -- tuning text-only and
-  # deploying multimodal would invalidate the result.
-  limit_mm_per_prompt: "image=0,video=0"
 
 static_environment_variables:
   VLLM_STARTUP_TIMEOUT: "1800"  # generous headroom for first-time weight download

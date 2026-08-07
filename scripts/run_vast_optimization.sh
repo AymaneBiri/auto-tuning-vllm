@@ -252,7 +252,6 @@ if [[ $DO_SMOKE -eq 1 ]]; then
       --max-model-len 8192 \
       --gpu-memory-utilization 0.92 \
       --no-enforce-eager \
-      --limit-mm-per-prompt image=0,video=0 \
       --kv-cache-dtype fp8 \
       --port "$SMOKE_PORT" > "$SMOKE_LOG" 2>&1 &
   SMOKE_PID=$!
