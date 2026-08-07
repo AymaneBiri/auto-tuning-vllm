@@ -1,0 +1,202 @@
+# Gemma 4 31B FP8 (dense, multimodal) on 8x NVIDIA H200 (141 GB HBM3e, SM90 Hopper)
+#
+# Model: RedHatAI/gemma-4-31B-it-FP8-Dynamic
+#   FP8 weight-quantized google/gemma-4-31B-it: per-channel static FP8 weights,
+#   per-token dynamic activations. Runs on Hopper and Blackwell.
+#   Chosen over the bf16 checkpoint because weights, not scheduling, were the
+#   binding constraint at TP=1 -- see the KV math below.
+#   Do NOT substitute gemma-4-31B-it-FP8-block: vLLM #39407 reports it emitting
+#   garbage repetitive output (logit saturation at the softcap wall from
+#   activation scales being double-applied). Plain per-tensor W8A8 also degrades
+#   on Gemma 4 due to persistent per-channel activation outliers; this per-token
+#   dynamic variant is the safe one.
+#
+# Architecture: 60 layers, hybrid attention -- 5 sliding-window (1024) layers per
+#   1 global layer, 16 KV heads, native context 262,144. Image + video input
+#   (no audio on 31B; audio is E2B/E4B/12B only).
+#   The two layer families use DIFFERENT head dims: sliding = 256, global = 512.
+#   That asymmetry drives both the KV math and the FlashAttention choice below.
+#
+# KV sizing at tensor_parallel_size=1, gpu_memory_utilization=0.92:
+#   budget ~130 GB - ~35 GB weights - ~4 GB overhead = ~91 GB for KV.
+#   (~31 GB of FP8 quantized layers plus embeddings / lm_head, which stay bf16 --
+#   at vocab 262,144 those are several GB and are not negligible here.)
+#   Per sequence at 1000 in + 500 out:
+#     50 sliding layers x 1024-token window x 16 KB = 800 MB   (fixed per seq)
+#     10 global  layers x 1500 tokens      x 32 KB = 469 MB
+#     total ~1.27 GB/seq at bf16 KV, ~0.65 GB/seq at fp8 KV
+#   -> ~71 concurrent at bf16 KV, ~140 at fp8 KV.
+#   (bf16 weights left only ~64 GB -> ~49 and ~98. The FP8 checkpoint buys roughly
+#   45% more concurrency before any scheduler knob is touched.)
+#
+#   rate: 160 is deliberately ABOVE both ceilings. Memory stays the binding
+#   constraint, so kv_cache_dtype actually competes instead of measuring flat.
+#   Verify the real number in the startup log ("GPU KV cache size: N tokens")
+#   before trusting it.
+#
+# Requires vLLM >= 0.19.0 (Gemma 4 day-0 support, 2026-04-03). pyproject pins
+# vllm==0.20.1, which is new enough for the model but see the FA4 note below.
+
+study:
+  name: "gemma4_31b_fp8_h200_throughput_ttft"
+
+optimization:
+  approach: "multi_objective"
+  objectives:
+    - metric: "output_tokens_per_second"   # throughput
+      direction: "maximize"
+      percentile: "median"
+    - metric: "time_to_first_token_ms"     # TTFT
+      direction: "minimize"
+      percentile: "p95"
+  sampler: "nsga2"          # recommended for multi-objective
+  # 5 tuned dims -> 3*3*2*2*2 = 72 distinct configs. The space is small enough to
+  # nearly enumerate; more trials than this just re-samples duplicates.
+  n_trials: 72
+  # tensor_parallel_size=1 => 1 GPU per trial => all 8 H200s run trials in
+  # parallel. ~72 trials / 8 at ~8 min each (FP8 load + 300 s benchmark) ~= 1.2 h.
+  max_concurrent_trials: 8
+
+benchmark:
+  benchmark_type: "guidellm"
+  model: "RedHatAI/gemma-4-31B-it-FP8-Dynamic"
+  max_seconds: 300
+  dataset: null             # synthetic data
+  prompt_tokens: 1000       # fixed length (no stdev set), keeps the sizing math exact
+  output_tokens: 500
+  rate: 160                 # concurrent requests (guidellm --rate-type concurrent)
+
+logging:
+  file_path: "/tmp/auto-tune-vllm-logs"
+  log_level: "INFO"
+
+baseline:
+  enabled: true
+  concurrency_levels: [160]  # pure vLLM defaults at the same load, for comparison
+
+static_parameters:
+  # TP=1 fits the FP8 31B on one H200 with plenty of room for KV, avoids
+  # all-reduce overhead, and gives the best throughput-per-GPU. It also lets 8
+  # trials run concurrently.
+  # Do NOT tune tensor_parallel_size in this study: trials would run on different
+  # GPU counts and raw throughput would not be comparable across them. Run a
+  # separate TP=2 study and compare per-GPU if you want that answer.
+  tensor_parallel_size: 1
+  # Deployment cap. Native context is 262144; tuning at 8192 is only valid for a
+  # deployment that also caps here. Raise both if you serve long context.
+  max_model_len: 8192
+  # Pinned, not searched. Within a benchmark this knob is monotonic (more memory
+  # is always more KV is always more throughput) so a search just returns the max
+  # every time. It is really a safety margin against traffic this synthetic load
+  # never generates, and the study has no way to price that risk.
+  gpu_memory_utilization: 0.92
+  # CUDA graphs are effectively always faster than eager for decode; enforce_eager
+  # is a debugging fallback, not a tuning knob. Pinned off rather than sampled.
+  enforce_eager: false
+  # Text-only synthetic workload: skip the multimodal encoder cache allocation.
+  # Remove this if you actually serve images/video -- tuning text-only and
+  # deploying multimodal would invalidate the result.
+  limit_mm_per_prompt: "image=0,video=0"
+
+static_environment_variables:
+  VLLM_STARTUP_TIMEOUT: "1800"  # generous headroom for first-time weight download
+  HF_TOKEN: "${HF_TOKEN}"       # expanded from your shell when the config loads
+
+parameters:
+  # ---- Batching / scheduling (main throughput <-> TTFT levers) ----
+  max_num_batched_tokens:
+    enabled: true
+    # chunked-prefill chunk size. Capped at 8192: vLLM #39914 reports engine hangs
+    # on Gemma 4 for large prefill batches caused by the interleaved-attention /
+    # p-RoPE transition, so do not push higher without watching for stalled trials.
+    options: [2048, 4096, 8192]
+
+  max_num_seqs:
+    enabled: true
+    # Rescaled for the FP8 checkpoint's larger KV budget:
+    #   64  = hard cap below even the bf16-KV ceiling (~71) -> pure queueing arm
+    #   128 = between the bf16-KV and fp8-KV ceilings
+    #   160 = matches offered load, i.e. unconstrained so KV alone is the limit
+    # Nothing above 160 would ever bind, since guidellm offers at most 160.
+    options: [64, 128, 160]
+
+  kv_cache_dtype:
+    enabled: true
+    # Independent of the FP8 *weights* -- this quantizes the KV cache itself,
+    # roughly doubling achievable concurrency (~71 -> ~140), which is why rate is
+    # set above the bf16-KV ceiling.
+    # No other value is worth searching on Hopper: "fp8" is an alias for fp8_e4m3,
+    # and fp8_e5m2 is also 1 byte -- identical memory, identical concurrency, only
+    # worse numerics. nvfp4 would halve KV again but is Blackwell-only.
+    # ACCURACY: fp8 weights and fp8 KV are separate quantizations that compound.
+    # The checkpoint's lossless claims do not automatically carry over with this
+    # enabled -- validate quality on the winning config before deploying it.
+    options: ["auto", "fp8"]
+
+  VLLM_FLASH_ATTN_VERSION:
+    enabled: true
+    env_var: true
+    # Potentially the biggest win on this specific hardware/model pair.
+    # Gemma 4's global layers use head_dim=512. FA3 -- the Hopper default -- maxes
+    # out at head_dim 256, so it covers the sliding layers but the global layers
+    # fall back to a slower kernel. FA4 handles 512 natively and unifies all
+    # layers on one kernel: reported +25-70% prefill throughput and up to -31%
+    # TTFT on Hopper.
+    # TWO THINGS TO VERIFY BEFORE TRUSTING THIS DIMENSION:
+    #   1. Your vLLM build must actually ship FA4 for Hopper (it landed ~July 2026;
+    #      0.20.1 may predate it). If not, "4" silently falls back to FA3 and the
+    #      dimension reads as "FA4 gives no benefit" -- a wrong answer, not a crash.
+    #   2. Confirm the env var is still honoured; the sibling VLLM_ATTENTION_BACKEND
+    #      was deprecated in favour of --attention-config.backend. The CLI
+    #      equivalent here is --attention-config.flash_attn_version.
+    # Check the vLLM startup log for the selected FA version on trial 0 either way.
+    options: ["3", "4"]
+
+  async_scheduling:
+    enabled: true
+    # Overlaps scheduling with execution. The vLLM Gemma 4 recipe recommends it,
+    # and vLLM's own default is false -- so leaving it out of the study would ship
+    # a recommended throughput win disabled. Worth the 1 binary dim.
+    options: [true, false]
+
+  # ---- Considered and deliberately NOT tuned ----
+
+  # speculative_config (Gemma 4 MTP): deliberately absent. MTP pays off when
+  # decode is memory-bandwidth bound at low batch; at concurrency 160 the GPU is
+  # compute-bound and verifying rejected drafts is wasted work. It also cannot be
+  # expressed as an on/off categorical here -- there is no JSON value for
+  # "disabled". Run it as a separate low-concurrency (rate ~8) latency study.
+
+  # attention_backend:
+  #   enabled: false
+  #   # FLASH_ATTN is the Hopper default and the recommended path for Gemma 4; the
+  #   # FA version above is the knob that actually matters, not the backend.
+  #   # FLASHINFER is opt-in on Hopper and NOT ruled out here (per vLLM's backend
+  #   # matrix it supports head sizes 64/128/256/512 on Hopper, so the 512 global
+  #   # layers are covered) -- but it is unproven for Gemma 4 and a bad trial burns
+  #   # ~9 min of an 8-GPU slot. Smoke-test it standalone before spending budget.
+  #   # TRITON_ATTN is the portable fallback and is slower on Hopper.
+  #   options: ["FLASH_ATTN", "FLASHINFER"]
+
+  # block_size:
+  #   enabled: false
+  #   # With the hybrid KV allocator this mostly shifts fragmentation, not speed,
+  #   # and 1024 divides evenly by both 16 and 32. Not worth 2x on the trial budget.
+  #   options: [16, 32]
+
+  # enable_prefix_caching:
+  #   enabled: false
+  #   # Synthetic prompts share almost no prefix, and prefix reuse only applies to
+  #   # the 10 global layers anyway. Leave vLLM's default in place.
+  #   options: [true, false]
+
+  # dtype:
+  #   enabled: false
+  #   # Gemma is trained in bfloat16 and is known to overflow/NaN in float16.
+  #   # Moot for an FP8 checkpoint anyway -- keep it disabled.
+  #   options: ["auto", "float16"]
+
+  # scheduling_policy:
+  #   enabled: false
+  #   # No-op here: guidellm sends no per-request priorities.
+  #   options: ["fcfs", "priority"]
