@@ -167,10 +167,16 @@ if [[ ! -d "$VENV" ]]; then
     python3 -m venv "$VENV"
   fi
 fi
+# set +u: some activate scripts reference unset vars (PS1) and would abort here.
+set +u
 # shellcheck disable=SC1091
 source "${VENV}/bin/activate"
+set -u
 
-if ! command -v auto-tune-vllm >/dev/null 2>&1; then
+# Check for the package inside the venv, not just a binary on PATH - a
+# system-wide auto-tune-vllm would otherwise mask an empty venv, and the venv is
+# what Ray workers are pointed at.
+if ! python -c 'import auto_tune_vllm' >/dev/null 2>&1; then
   log "Installing auto-tune-vllm (pulls vLLM + torch; this takes a while)"
   if command -v uv >/dev/null 2>&1; then
     uv pip install -e .
@@ -179,7 +185,17 @@ if ! command -v auto-tune-vllm >/dev/null 2>&1; then
   fi
 fi
 
-python -c 'import vllm, guidellm; print(f"  vLLM     : {vllm.__version__}\n  guidellm : {guidellm.__version__}")'
+# Informational only - never fatal. Read versions from distribution metadata
+# rather than __version__ attributes, which not every package defines
+# (guidellm does not), and which would otherwise require importing vLLM.
+python - <<'PY' || warn "Could not read package versions (non-fatal)."
+from importlib.metadata import version, PackageNotFoundError
+for pkg in ("vllm", "guidellm", "optuna", "ray"):
+    try:
+        print(f"  {pkg:<9}: {version(pkg)}")
+    except PackageNotFoundError:
+        print(f"  {pkg:<9}: NOT INSTALLED")
+PY
 echo "  NOTE: the config's VLLM_FLASH_ATTN_VERSION=4 arm needs a build that ships"
 echo "        FA4 for Hopper. On an older vLLM it silently falls back to FA3."
 
@@ -220,8 +236,13 @@ if [[ $DO_SMOKE -eq 1 ]]; then
   SMOKE_PID=$!
 
   for _ in $(seq 1 120); do
-    grep -qiE "Application startup complete|GPU KV cache size" "$SMOKE_LOG" && break
-    kill -0 "$SMOKE_PID" 2>/dev/null || break
+    if grep -qiE "Application startup complete|GPU KV cache size" "$SMOKE_LOG"; then
+      break
+    fi
+    if ! kill -0 "$SMOKE_PID" 2>/dev/null; then
+      warn "vLLM exited during the smoke test - see ${SMOKE_LOG}"
+      break
+    fi
     sleep 10
   done
 
